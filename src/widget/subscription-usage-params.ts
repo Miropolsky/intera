@@ -1,3 +1,10 @@
+import { toFiniteNumber } from '../platform/to-finite-number';
+import {
+  readBoolean,
+  readEnum,
+  readString,
+  isRecord,
+} from '../platform/widget-param-readers';
 import {
   WIDGET_ROW_LIMITS,
   WIDGET_SIZES,
@@ -8,7 +15,7 @@ import {
 export const LIMIT_TYPES = ['data', 'voice', 'money'] as const;
 export type TLimitType = (typeof LIMIT_TYPES)[number];
 
-export const SUBSCRIPTION_STATUSES = [
+const SUBSCRIPTION_STATUSES = [
   'normal',
   'warning',
   'critical',
@@ -23,11 +30,13 @@ export type TStatusFilter = (typeof STATUS_FILTERS)[number];
 export const SORT_MODES = ['usage_desc', 'usage_asc', 'customer_name'] as const;
 export type TSortMode = (typeof SORT_MODES)[number];
 
-export const MIN_THRESHOLD_PERCENT = 1;
-export const MAX_THRESHOLD_PERCENT = 500;
-export const DEFAULT_WARNING_THRESHOLD = 80;
-export const DEFAULT_CRITICAL_THRESHOLD = 100;
-export const DEFAULT_ROW_LIMIT: TWidgetRowLimit = 10;
+const MIN_THRESHOLD_PERCENT = 1;
+const MAX_THRESHOLD_PERCENT = 500;
+const DEFAULT_WARNING_THRESHOLD = 80;
+const DEFAULT_CRITICAL_THRESHOLD = 100;
+const DEFAULT_ROW_LIMIT: TWidgetRowLimit = 10;
+
+const PERIOD_PREFIX = /^(\d{4})-(0[1-9]|1[0-2])$/;
 
 export interface ISubscriptionUsageConfig {
   /** Card header title (`params.description`, with fallback to `params.title` or `'Subscription Usage'`). */
@@ -37,7 +46,7 @@ export interface ISubscriptionUsageConfig {
   /** Card width slot (`full` | `half` | `third` | `quarter`). */
   size: TWidgetSize;
   /**
-   * Billing period filter (`'all'` or a `YYYY-MM` / `YYYY-MM-DD` string matched by leading `YYYY-MM`).
+   * Billing period filter (`'all'` or a `YYYY-MM` prefix of `allowance_period`).
    * Default: `'all'`.
    */
   period: string;
@@ -79,43 +88,144 @@ export interface ISubscriptionUsageConfig {
 export function parseSubscriptionUsageParams(
   params: Record<string, unknown> | undefined,
 ): ISubscriptionUsageConfig {
-  const p = params ?? {};
+  const source = isRecord(params) ? params : {};
+  const warningThreshold = readThreshold(
+    source.warningThreshold,
+    DEFAULT_WARNING_THRESHOLD,
+  );
+  const criticalThreshold = readThreshold(
+    source.criticalThreshold,
+    DEFAULT_CRITICAL_THRESHOLD,
+  );
+  const thresholdsAreOrdered = warningThreshold < criticalThreshold;
 
-  // TODO: Implement full defensive parsing and threshold validation according to the specification.
   return {
-    description:
-      typeof p.description === 'string' && p.description.trim()
-        ? p.description.trim()
-        : typeof p.title === 'string' && p.title.trim()
-          ? p.title.trim()
-          : 'Subscription Usage',
-    subtitle: typeof p.subtitle === 'string' ? p.subtitle.trim() : '',
-    size: WIDGET_SIZES.includes(p.size as TWidgetSize)
-      ? (p.size as TWidgetSize)
-      : 'full',
-    period:
-      typeof p.period === 'string' && p.period.trim()
-        ? p.period.trim()
-        : 'all',
-    customerId:
-      typeof p.customerId === 'number' && Number.isFinite(p.customerId)
-        ? p.customerId
-        : 'all',
-    technologyIds: Array.isArray(p.technologyIds)
-      ? p.technologyIds.filter(
-          (id): id is number => typeof id === 'number' && Number.isFinite(id),
-        )
-      : [],
-    onlyActive: typeof p.onlyActive === 'boolean' ? p.onlyActive : true,
-    limitTypes: [...LIMIT_TYPES],
-    warningThreshold: DEFAULT_WARNING_THRESHOLD,
-    criticalThreshold: DEFAULT_CRITICAL_THRESHOLD,
-    statusFilter: 'all',
-    rowLimit: WIDGET_ROW_LIMITS.includes(p.rowLimit as TWidgetRowLimit)
-      ? (p.rowLimit as TWidgetRowLimit)
-      : DEFAULT_ROW_LIMIT,
-    showSummary: typeof p.showSummary === 'boolean' ? p.showSummary : true,
-    showDetails: typeof p.showDetails === 'boolean' ? p.showDetails : true,
-    sortBy: 'usage_desc',
+    description: readDescription(source),
+    subtitle: readString(source.subtitle).trim(),
+    size: readEnum(source.size, WIDGET_SIZES, 'full'),
+    period: readPeriod(source.period),
+    customerId: readCustomerId(source.customerId),
+    technologyIds: readTechnologyIds(source.technologyIds),
+    onlyActive: readBoolean(source.onlyActive, true),
+    limitTypes: readLimitTypes(source.limitTypes),
+    warningThreshold: thresholdsAreOrdered
+      ? warningThreshold
+      : DEFAULT_WARNING_THRESHOLD,
+    criticalThreshold: thresholdsAreOrdered
+      ? criticalThreshold
+      : DEFAULT_CRITICAL_THRESHOLD,
+    statusFilter: readEnum(source.statusFilter, STATUS_FILTERS, 'all'),
+    rowLimit:
+      readRowLimit(source.rowLimit) ??
+      readRowLimit(source.maxRows) ??
+      DEFAULT_ROW_LIMIT,
+    showSummary: readBoolean(source.showSummary, true),
+    showDetails: readBoolean(source.showDetails, true),
+    sortBy: readEnum(source.sortBy, SORT_MODES, 'usage_desc'),
   };
+}
+
+function readDescription(source: Record<string, unknown>): string {
+  const description = readString(source.description).trim();
+  if (description) {
+    return description;
+  }
+  const title = readString(source.title).trim();
+  return title || 'Subscription Usage';
+}
+
+/** `'all'` or a normalised `YYYY-MM`. Anything else falls back to `'all'`. */
+function readPeriod(value: unknown): string {
+  if (typeof value !== 'string') {
+    return 'all';
+  }
+  const trimmed = value.trim();
+  if (trimmed === 'all') {
+    return 'all';
+  }
+  const match = PERIOD_PREFIX.exec(trimmed);
+  if (match) {
+    return `${match[1]}-${match[2]}`;
+  }
+  // The table contract allows a full YYYY-MM-DD value; normalise it to the month.
+  const dateMatch = /^(\d{4})-(0[1-9]|1[0-2])-\d{2}$/.exec(trimmed);
+  return dateMatch ? `${dateMatch[1]}-${dateMatch[2]}` : 'all';
+}
+
+function readCustomerId(value: unknown): number | 'all' {
+  if (value === 'all') {
+    return 'all';
+  }
+  const parsed = toFiniteNumber(value);
+  if (parsed === null || parsed <= 0) {
+    return 'all';
+  }
+  return parsed;
+}
+
+function readTechnologyIds(value: unknown): number[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  const seen = new Set<number>();
+  const ids: number[] = [];
+  for (const entry of value) {
+    const parsed = toFiniteNumber(entry);
+    if (parsed === null || seen.has(parsed)) {
+      continue;
+    }
+    seen.add(parsed);
+    ids.push(parsed);
+  }
+  return ids;
+}
+
+function readLimitTypes(value: unknown): TLimitType[] {
+  if (!Array.isArray(value)) {
+    return [...LIMIT_TYPES];
+  }
+  const seen = new Set<TLimitType>();
+  const types: TLimitType[] = [];
+  for (const entry of value) {
+    if (!isLimitType(entry) || seen.has(entry)) {
+      continue;
+    }
+    seen.add(entry);
+    types.push(entry);
+  }
+  return types.length > 0 ? types : [...LIMIT_TYPES];
+}
+
+function isLimitType(value: unknown): value is TLimitType {
+  return (
+    typeof value === 'string' &&
+    (LIMIT_TYPES as readonly string[]).includes(value)
+  );
+}
+
+/**
+ * Finite numbers are clamped into `[1, 500]`. Missing or non-numeric values
+ * keep the field default so a typo does not silently become the minimum.
+ */
+function readThreshold(value: unknown, fallback: number): number {
+  const parsed = toFiniteNumber(value);
+  if (parsed === null) {
+    return fallback;
+  }
+  return Math.min(
+    MAX_THRESHOLD_PERCENT,
+    Math.max(MIN_THRESHOLD_PERCENT, parsed),
+  );
+}
+
+function readRowLimit(value: unknown): TWidgetRowLimit | null {
+  const parsed = toFiniteNumber(value);
+  if (parsed === null || !isRowLimit(parsed)) {
+    return null;
+  }
+  return parsed;
+}
+
+function isRowLimit(value: number): value is TWidgetRowLimit {
+  return (WIDGET_ROW_LIMITS as readonly number[]).includes(value);
 }
